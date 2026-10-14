@@ -1,0 +1,46 @@
+graph TD
+    subgraph PHASE 1: Data Validation & Noise Isolation
+        A1[(Dữ liệu Khớp Học viên<br>MediaPipe CSV)] --> B
+        A2[(Dữ liệu Khớp Giáo viên<br>MediaPipe CSV)] --> B
+        B{Bộ lọc Động lượng<br>Std > 0.015?}
+        B -- Không (Video tĩnh) --> Z([Loại bỏ Video])
+        B -- Có (Video động) --> C1
+    end
+
+    subgraph PHASE 2: Signal Reconstruction & Scaling
+        C1[Nội suy tuyến tính<br>Phục hồi điểm bị khuất] --> C2
+        C2[Dời gốc tọa độ 2D<br>Root-centering tại Hông] --> C3
+        C3[Chuẩn hóa Giải phẫu<br>Chia tỷ lệ theo Thân người]
+    end
+
+    subgraph PHASE 3: Synchronization & Feature Extraction
+        C3 --> D1
+        D1[FastDTW<br>Gióng hàng thời gian] --> D2
+        D2[Trích xuất Đặc trưng Lõi]
+        D2 --> F1(1. Joint Error<br>Sai số Không gian)
+        D2 --> F2(2. Joint Cosine<br>Sai số Hướng vector)
+        D2 --> F3(3. Velocity Error<br>Sai số Động lực học)
+    end
+
+    subgraph PHASE 4: AI Joint-Level Classification
+        F1 --> G
+        F2 --> G
+        F3 --> G
+        G[[Mô hình Học máy Nhị phân<br>Gradient Boosting / CatBoost]]
+        G --> H[Phán quyết Cấp độ Khớp<br>PASS=1 / FAIL=0]
+    end
+
+    subgraph PHASE 5: Frame-Level Heuristics & Decision
+        H --> I[Quy đổi Barem Phẳng<br>Weight = 1.0 cho 13 khớp]
+        I --> J[Tính Tổng điểm Khung hình<br>S_frame]
+        J --> K{Tối ưu hóa Grid Search<br>Threshold T = 7.1}
+        K -- S_frame < 7.1 --> L1[Khung hình LỖI - Fail]
+        K -- S_frame >= 7.1 --> L2[Khung hình ĐÚNG - Pass]
+        L1 --> M(((Điểm số Bài nhảy<br>Final Accuracy)))
+        L2 --> M(((Điểm số Bài nhảy<br>Final Accuracy)))
+    end
+
+    style B fill:#ffe6e6,stroke:#ff0000
+    style G fill:#e6f3ff,stroke:#0066cc,stroke-width:2px
+    style K fill:#fff2cc,stroke:#ffcc00,stroke-width:2px
+    style M fill:#d9ead3,stroke:#38761d,stroke-width:3px
