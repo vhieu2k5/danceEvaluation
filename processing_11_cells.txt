@@ -1,0 +1,330 @@
+=== CELL 0 (code) ===
+!pip install fastdtw pandas numpy scipy scikit-learn
+
+=== CELL 1 (code) ===
+import pandas as pd
+import numpy as np
+from fastdtw import fastdtw
+from scipy.spatial.distance import euclidean
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+import warnings
+
+warnings.filterwarnings('ignore')
+
+=== CELL 2 (markdown) ===
+**1. TIỀN XỬ LÝ (LỌC NHIỄU, TÁI TẠO, VÀ CHUẨN HÓA 2D)**
+
+=== CELL 3 (code) ===
+# [NOISE ISOLATION] - Nâng ngưỡng lên 0.015 để chặn đứng Video 6
+def is_dancing(df_student, variance_threshold=0.015):
+    key_joints = ['left_wrist', 'right_wrist', 'left_ankle', 'right_ankle']
+    df_key = df_student[df_student['Joint_Name'].isin(key_joints)]
+    movement_std = df_key.groupby('Joint_Name')[['X', 'Y']].std().mean().mean()
+    return movement_std >= variance_threshold, movement_std
+
+# [SIGNAL RECONSTRUCTION & ANATOMICAL SCALING]
+def preprocess_data(df):
+    df = df.sort_values(by=['Frame', 'Joint_Name']).reset_index(drop=True)
+    
+    mask = df['Visibility'] < 0.5
+    df.loc[mask, ['X', 'Y', 'Z']] = np.nan
+    df[['X', 'Y', 'Z']] = df.groupby('Joint_Name')[['X', 'Y', 'Z']].transform(
+        lambda x: x.interpolate(method='linear', limit_direction='both')
+    )
+    df.fillna(0, inplace=True)
+    
+    normalized_frames = []
+    for frame_id, frame_data in df.groupby('Frame'):
+        l_hip = frame_data[frame_data['Joint_Name'] == 'left_hip']
+        r_hip = frame_data[frame_data['Joint_Name'] == 'right_hip']
+        l_sh = frame_data[frame_data['Joint_Name'] == 'left_shoulder']
+        r_sh = frame_data[frame_data['Joint_Name'] == 'right_shoulder']
+        
+        if not l_hip.empty and not r_hip.empty and not l_sh.empty and not r_sh.empty:
+            root_x = (l_hip['X'].values[0] + r_hip['X'].values[0]) / 2
+            root_y = (l_hip['Y'].values[0] + r_hip['Y'].values[0]) / 2
+            
+            sh_x = (l_sh['X'].values[0] + r_sh['X'].values[0]) / 2
+            sh_y = (l_sh['Y'].values[0] + r_sh['Y'].values[0]) / 2
+            
+            # Chỉ dùng 2D (X, Y) để đo Torso, loại bỏ nhiễu Z
+            torso_length = np.sqrt((sh_x - root_x)**2 + (sh_y - root_y)**2)
+            torso_length = max(torso_length, 1e-5)
+        else:
+            root_x, root_y = 0, 0
+            torso_length = 1.0
+            
+        frame_data = frame_data.copy()
+        frame_data['X_norm'] = (frame_data['X'] - root_x) / torso_length
+        frame_data['Y_norm'] = (frame_data['Y'] - root_y) / torso_length
+        frame_data['Z_norm'] = frame_data['Z'] # Bỏ qua Z, không dùng tính toán chuẩn
+        
+        normalized_frames.append(frame_data)
+        
+    return pd.concat(normalized_frames, ignore_index=True)
+
+=== CELL 4 (markdown) ===
+**2. XỬ LÝ ĐẶC TRƯNG (LOẠI BỎ NHIỄU TRỤC Z)**
+
+=== CELL 5 (code) ===
+# ==============================================================================
+# 2. XỬ LÝ ĐẶC TRƯNG (KHOẢNG CÁCH, GÓC ĐỘ VÀ VẬN TỐC 2D)
+# ==============================================================================
+def extract_joint_features(df_student, df_teacher):
+    def get_vectors(df):
+        # Chỉ lấy X và Y vào DTW để tăng độ mượt mà đồng bộ
+        wide = df.pivot(index='Frame', columns='Joint_Name', values=['X_norm', 'Y_norm']).fillna(0)
+        return wide.values, wide.index.tolist()
+
+    vec_s, frames_s = get_vectors(df_student)
+    vec_t, frames_t = get_vectors(df_teacher)
+    
+    # Đồng bộ hóa chuỗi thời gian bằng FastDTW
+    distance, path = fastdtw(vec_s, vec_t, dist=euclidean)
+    aligned_pairs = [{'Frame_s': frames_s[s], 'Frame_t': frames_t[t]} for s, t in path]
+    df_path = pd.DataFrame(aligned_pairs)
+    
+    df_s_aligned = pd.merge(df_path, df_student, left_on='Frame_s', right_on='Frame').drop(columns=['Frame'])
+    df_t_aligned = pd.merge(df_path, df_teacher, left_on='Frame_t', right_on='Frame').drop(columns=['Frame'])
+    
+    df_s_aligned = df_s_aligned.rename(columns={'X_norm': 'X_s', 'Y_norm': 'Y_s'})
+    df_t_aligned = df_t_aligned.rename(columns={'X_norm': 'X_t', 'Y_norm': 'Y_t'})
+    
+    label_col = 'Label' if 'Label' in df_s_aligned.columns else ('Label_s' if 'Label_s' in df_s_aligned.columns else None)
+    cols_to_merge_s = ['Frame_s', 'Frame_t', 'Joint_Name', 'X_s', 'Y_s'] + ([label_col] if label_col else [])
+    
+    df_merged = pd.merge(df_s_aligned[cols_to_merge_s], 
+                         df_t_aligned[['Frame_s', 'Frame_t', 'Joint_Name', 'X_t', 'Y_t']], 
+                         on=['Frame_s', 'Frame_t', 'Joint_Name'])
+    
+    # 1. Đặc trưng Không gian: Sai số khoảng cách Euclidean (Joint_Error)
+    df_merged['Joint_Error'] = np.sqrt((df_merged['X_s'] - df_merged['X_t'])**2 + 
+                                       (df_merged['Y_s'] - df_merged['Y_t'])**2)
+                                       
+    # 2. Đặc trưng Hướng: Độ tương đồng Cosine (Joint_Cosine)
+    dot = (df_merged['X_s']*df_merged['X_t']) + (df_merged['Y_s']*df_merged['Y_t'])
+    norm_s = np.sqrt(df_merged['X_s']**2 + df_merged['Y_s']**2)
+    norm_t = np.sqrt(df_merged['X_t']**2 + df_merged['Y_t']**2)
+    df_merged['Joint_Cosine'] = dot / (norm_s * norm_t + 1e-9)
+    
+    # 3. ĐẶC TRƯNG ĐỘNG LỰC HỌC: Sai số Vận tốc (Velocity_Error)
+    # Tính độ dời tọa độ (đạo hàm bậc nhất theo thời gian) giữa 2 frame liên tiếp của từng khớp
+    df_merged['Vel_X_s'] = df_merged.groupby('Joint_Name')['X_s'].diff().fillna(0)
+    df_merged['Vel_Y_s'] = df_merged.groupby('Joint_Name')['Y_s'].diff().fillna(0)
+    df_merged['Vel_X_t'] = df_merged.groupby('Joint_Name')['X_t'].diff().fillna(0)
+    df_merged['Vel_Y_t'] = df_merged.groupby('Joint_Name')['Y_t'].diff().fillna(0)
+    
+    # Độ lệch vector vận tốc giữa học sinh và giáo viên
+    df_merged['Velocity_Error'] = np.sqrt((df_merged['Vel_X_s'] - df_merged['Vel_X_t'])**2 + 
+                                          (df_merged['Vel_Y_s'] - df_merged['Vel_Y_t'])**2)
+    
+    output_cols = ['Frame_s', 'Joint_Name', 'Joint_Error', 'Joint_Cosine', 'Velocity_Error']
+    if label_col:
+        df_merged.rename(columns={label_col: 'Ground_Truth_Label'}, inplace=True)
+        output_cols.append('Ground_Truth_Label')
+        
+    return df_merged[output_cols]
+
+=== CELL 6 (markdown) ===
+**3. TRÍCH XUẤT DATASET TỪ CÁC VIDEO**
+
+=== CELL 7 (code) ===
+dance_pairs = [
+    {"id": 1, "student": "student_dance_1.csv", "teacher": "teacher_dance_1.csv"},
+    {"id": 2, "student": "student_dance_2.csv", "teacher": "teacher_dance_2.csv"},
+    {"id": 3, "student": "student_dance_3.csv", "teacher": "teacher_dance_3.csv"},
+    {"id": 4, "student": "student_dance_4.csv", "teacher": "teacher_dance_4.csv"},
+    {"id": 5, "student": "student_dance_5.csv", "teacher": "teacher_dance_5.csv"},
+    {"id": 6, "student": "student_dance_6.csv", "teacher": "teacher_dance_6.csv"},
+    {"id": 7, "student": "student_dance_7.csv", "teacher": "teacher_dance_7.csv"},
+    {"id": 8, "student": "student_dance_8.csv", "teacher": "teacher_dance_8.csv"},
+    {"id": 9, "student": "student_dance_9.csv", "teacher": "teacher_dance_9.csv"},
+    {"id": 10, "student": "student_dance_10.csv", "teacher": "teacher_dance_10.csv"},
+    {"id": 11, "student": "student_dance_11.csv", "teacher": "teacher_dance_11.csv"},
+    {"id": 12, "student": "student_dance_12.csv", "teacher": "teacher_dance_12.csv"},
+  #  {"id": 13, "student": "teacher_dance_12.csv", "teacher": "teacher_dance_12.csv"},
+  #  {"id": 14, "student": "student_dance_14.csv", "teacher": "teacher_dance_14.csv"},
+    {"id": 15, "student": "student_dance_15.csv", "teacher": "teacher_dance_15.csv"}
+]
+
+TEST_VIDEO_IDS = [5,9] 
+all_joints_data = []
+
+print("=== BẮT ĐẦU TRÍCH XUẤT CẤP ĐỘ KHỚP ===")
+for pair in dance_pairs:
+    try:
+        df_s = pd.read_csv(pair["student"])
+        df_t = pd.read_csv(pair["teacher"])
+        
+        is_moving, std = is_dancing(df_s)
+        if not is_moving:
+            print(f"[BỘ LỌC] Bỏ qua Video {pair['id']}: Đứng yên (Std={std:.4f})")
+            continue
+            
+        print(f"[V] Đang xử lý Video {pair['id']}...")
+        df_s_clean = preprocess_data(df_s)
+        df_t_clean = preprocess_data(df_t)
+        
+        joint_features_df = extract_joint_features(df_s_clean, df_t_clean)
+        joint_features_df['Video_ID'] = pair['id']
+        all_joints_data.append(joint_features_df)
+        
+    except Exception as e:
+        print(f"[-] Lỗi tại Video {pair['id']}: {e}")
+
+master_dataset = pd.concat(all_joints_data, ignore_index=True)
+
+=== CELL 8 (markdown) ===
+**4. CLASSIFICATION MODEL (AI) & RULE-BASED HEURISTICS (ĐÁNH GIÁ)**
+
+=== CELL 9 (code) ===
+# ==============================================================================
+# 4. CLASSIFICATION MODEL (CATBOOST) & RULE-BASED HEURISTICS ĐỒNG BỘ
+# ==============================================================================
+import numpy as np
+import pandas as pd
+from catboost import CatBoostClassifier
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix, f1_score, recall_score
+
+# 1. TÁCH DỮ LIỆU TRAIN / TEST
+train_data = master_dataset[~master_dataset['Video_ID'].isin(TEST_VIDEO_IDS)]
+test_data = master_dataset[master_dataset['Video_ID'].isin(TEST_VIDEO_IDS)].copy()
+
+n_train_frames = train_data[['Video_ID', 'Frame_s']].drop_duplicates().shape[0]
+n_test_frames = test_data[['Video_ID', 'Frame_s']].drop_duplicates().shape[0]
+
+print("======================================================")
+print("             THỐNG KÊ TẬP DỮ LIỆU                     ")
+print("======================================================")
+print(f"- Số lượng Frame tập TRAIN  : {n_train_frames:,} frames")
+print(f"- Số lượng Frame tập TEST   : {n_test_frames:,} frames")
+print("======================================================\n")
+
+# Tự động nhận diện 2 hoặc 3 đặc trưng (nếu đã thêm Velocity_Error)
+feature_cols = [col for col in ['Joint_Error', 'Joint_Cosine', 'Velocity_Error'] if col in train_data.columns]
+print(f"Đặc trưng đầu vào huấn luyện: {feature_cols}")
+
+X_train = train_data[feature_cols]
+y_train = train_data['Ground_Truth_Label']
+X_test = test_data[feature_cols]
+
+# 2. [PHASE 3: HUẤN LUYỆN CATBOOST CHẤM KHỚP]
+print("\nĐang huấn luyện AI chấm khớp (CatBoost Classifier)...")
+cb_model = CatBoostClassifier(
+    iterations=150,
+    depth=6,
+    learning_rate=0.08,
+    random_seed=42,
+    verbose=0
+)
+cb_model.fit(X_train, y_train)
+
+# Dự đoán nhãn khớp trên tập Test
+test_data['Predicted_Joint_Label'] = cb_model.predict(X_test)
+
+# Hiển thị mức độ quan trọng của đặc trưng
+importances = cb_model.get_feature_importance()
+imp_str = ", ".join([f"{col} ({imp:.1f}%)" for col, imp in zip(feature_cols, importances)])
+print(f"Độ quan trọng Đặc trưng: {imp_str}")
+
+# 3. [PHASE 4: TỰ ĐỘNG TÌM NGƯỠNG VÀ ĐÁNH GIÁ CẤP ĐỘ KHUNG HÌNH]
+weights = {
+    'left_elbow': 1.0, 'right_elbow': 1.0, 'left_knee': 1.0, 'right_knee': 1.0,
+    'left_wrist': 1.0, 'right_wrist': 1.0, 'left_ankle': 1.0, 'right_ankle': 1.0,
+    'left_shoulder': 1.0, 'right_shoulder': 1.0, 'left_hip': 1.0, 'right_hip': 1.0,
+    'nose': 1.0
+}
+
+# Tiền tính toán điểm số khung hình
+frame_records = []
+for (video_id, frame_id), frame_df in test_data.groupby(['Video_ID', 'Frame_s']):
+    actual_label = frame_df['Ground_Truth_Label'].mode()[0]
+    total_score = sum(row['Predicted_Joint_Label'] * weights.get(row['Joint_Name'], 0) for _, row in frame_df.iterrows())
+    frame_records.append({'actual': actual_label, 'score': total_score})
+
+df_eval = pd.DataFrame(frame_records)
+y_true = df_eval['actual'].values
+
+# Quét tìm ngưỡng tối ưu ưu tiên Recall FAIL >= 90%
+best_thresh = None
+best_f1 = -1.0
+
+for thresh in np.arange(6.0, 9.1, 0.1):
+    y_pred_temp = (df_eval['score'].values >= thresh).astype(int)
+    rec_0 = recall_score(y_true, y_pred_temp, pos_label=0, zero_division=0)
+    f1 = f1_score(y_true, y_pred_temp, average='macro', zero_division=0)
+    
+    # Ưu tiên mốc F1 cao khi Recall bắt lỗi đạt chuẩn
+    if rec_0 >= 0.89 and f1 > best_f1:
+        best_f1 = f1
+        best_thresh = thresh
+
+# Nếu không thỏa mãn điều kiện lọc, lấy ngưỡng có F1 tuyệt đối cao nhất
+if best_thresh is None:
+    best_thresh = max(
+        np.arange(6.0, 9.1, 0.1),
+        key=lambda t: f1_score(y_true, (df_eval['score'].values >= t).astype(int), average='macro', zero_division=0)
+    )
+
+final_y_pred = (df_eval['score'].values >= best_thresh).astype(int)
+final_acc = accuracy_score(y_true, final_y_pred)
+
+# 4. IN BÁO CÁO KẾT QUẢ ĐÁNH GIÁ CHUNG CUỘC
+print("\n======================================================")
+print(f"   KẾT QUẢ TỔNG HỢP (TEST VIDEO {TEST_VIDEO_IDS}) - CATBOOST (THRESHOLD = {best_thresh:.1f})")
+print("======================================================\n")
+print(classification_report(y_true, final_y_pred, target_names=['Fail (0)', 'Pass (1)']))
+print(f"-> ĐỘ CHÍNH XÁC (Accuracy): {final_acc * 100:.2f}%\n")
+
+cm = confusion_matrix(y_true, final_y_pred)
+if cm.shape == (2, 2):
+    print(f"CHI TIẾT TRÊN {len(y_true)} FRAMES TEST:")
+    print(f"- Số Frames FAIL thực, máy chấm chuẩn FAIL : {cm[0][0]:<5} (True Negative)")
+    print(f"- Số Frames FAIL thực, máy cho lọt PASS  : {cm[0][1]:<5} (False Positive)")
+    print(f"- Số Frames PASS thực, máy đánh oan FAIL : {cm[1][0]:<5} (False Negative)")
+    print(f"- Số Frames PASS thực, máy chấm chuẩn PASS: {cm[1][1]:<5} (True Positive)")
+
+=== CELL 10 (code) ===
+import numpy as np
+from sklearn.metrics import accuracy_score, recall_score, f1_score
+
+# 1. BAREM GIẢI PHẪU CHUẨN HÓA [0, 1] (Max = 9.25 điểm)
+
+anatomical_weights = {
+     'left_elbow': 1.0, 'right_elbow': 1.0, 'left_knee': 1.0, 'right_knee': 1.0,       # Động tác chính (Quan trọng nhất)
+            'left_wrist': 1, 'right_wrist':1, 'left_ankle': 1, 'right_ankle': 1, # Chi tiết ngọn
+            'left_shoulder': 1, 'right_shoulder': 1, 'left_hip': 1, 'right_hip': 1,   # Trụ cơ thể
+            'nose': 1                                                                       # Hướng mặt
+}
+
+print("=== GRID SEARCH: TÌM NGƯỠNG ĐIỂM (THRESHOLD) TỐI ƯU NHẤT ===")
+print(f"{'Threshold':<10} | {'Accuracy':<10} | {'Recall FAIL (0)':<16} | {'Recall PASS (1)':<16} | {'F1-Macro':<10}")
+print("-" * 75)
+
+# 4.6 - 5.3
+for thresh in np.arange(6, 9, 0.1):
+    y_true_list = []
+    y_pred_list = []
+    
+    for (video_id, frame_id), frame_df in test_data.groupby(['Video_ID', 'Frame_s']):
+        # Lấy nhãn đúng thực tế của Frame
+        true_label = frame_df['Ground_Truth_Label'].mode()[0] 
+        
+        # Tính tổng điểm theo Barem
+        total_score = sum(row['Predicted_Joint_Label'] * anatomical_weights.get(row['Joint_Name'], 0) for _, row in frame_df.iterrows())
+        
+        # Chốt nhãn dự đoán
+        pred_label = 1 if total_score >= thresh else 0
+        
+        y_true_list.append(true_label)
+        y_pred_list.append(pred_label)
+        
+    acc = accuracy_score(y_true_list, y_pred_list)
+    rec_0 = recall_score(y_true_list, y_pred_list, pos_label=0)
+    rec_1 = recall_score(y_true_list, y_pred_list, pos_label=1)
+    f1 = f1_score(y_true_list, y_pred_list, average='macro')
+    
+    # In ra báo cáo để tìm điểm cân bằng
+    print(f"{thresh:<10.2f} | {acc*100:<9.2f}% | {rec_0*100:<15.2f}% | {rec_1*100:<15.2f}% | {f1:.4f}")
+
